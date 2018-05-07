@@ -1,0 +1,3 @@
+var x = Array.apply(null, {length: 100000}).map(Number.call, Number)
+var mySocket = new WebSocket('ws://localhost:8080/measurements');
+x.forEach(function (n) { mySocket.send(n); })
