@@ -6,10 +6,11 @@ import akka.http.scaladsl.model.ws.WebSocketRequest
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.model.{StatusCode, StatusCodes}
 import akka.http.scaladsl.model.ws.{Message, TextMessage, WebSocketUpgradeResponse}
+import akka.pattern.{Backoff, BackoffSupervisor}
 import akka.stream._
 import akka.stream.scaladsl.{Flow, GraphDSL, Keep, Sink, Source}
 import com.acevedo.actors.WindTurbineSimulator._
-
+import scala.language.postfixOps
 import scala.concurrent.duration._
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Random, Success}
@@ -23,6 +24,8 @@ object WindTurbineSimulator {
   final case object Terminated
   final case class ConnectionFailure(ex: Throwable)
   final case class FailedUpgrade(statusCode: StatusCode)
+  final case object QueryActorPath
+  final case class SimulatorActorPath(path: String)
 }
 
 case class WindTurbineSimulatorException(id: String) extends Exception
@@ -72,11 +75,12 @@ class WebSocketClient(id: String, endpoint: String, supervisor: ActorRef)
                       materializer: ActorMaterializer,
                       executionContext: ExecutionContext) {
   val webSocket: Flow[Message, Message, Future[WebSocketUpgradeResponse]] = {
-    val websocketUri = s"$endpoint/$id"
+    //val websocketUri = s"$endpoint/$id"
+    val websocketUri = s"$endpoint"
     Http().webSocketClientFlow(WebSocketRequest(websocketUri))
   }
 
-  val outgoing = GraphDSL.create() { implicit builder =>
+  val outgoing: Graph[SourceShape[TextMessage.Strict], NotUsed] = GraphDSL.create() { implicit builder =>
     val data = WindTurbineData(id)
 
     val flow = builder.add {
@@ -112,7 +116,6 @@ class WebSocketClient(id: String, endpoint: String, supervisor: ActorRef)
     .viaMat(KillSwitches.single)(Keep.both) // also keep the KillSwitch
     .via(incoming)
     .toMat(Sink.ignore)(Keep.both) // also keep the Future[Done]
-    //.toMat(Sink.fromGraph(incoming))(Keep.both)
     .run()
 
   val connected = upgradeResponse.map { upgrade =>
@@ -158,23 +161,30 @@ class WindTurbineData(id: String) {
 }
 
 object SimulateWindTurbines extends App {
-  implicit val system = ActorSystem()
-  implicit val materializer = ActorMaterializer()
+  implicit val system: ActorSystem = ActorSystem()
+  implicit val materializer: ActorMaterializer = ActorMaterializer()
   implicit val ec: ExecutionContext = system.dispatcher
 
-  val id = java.util.UUID.randomUUID.toString
-  system.actorOf(WindTurbineSimulator.props(id, "ws://echo.websocket.org"), id)
+  Source(1 to 1000)
+    .throttle(
+      elements = 100,
+      per = 1 second,
+      maximumBurst = 100,
+      mode = ThrottleMode.shaping
+    )
+    .map { _ =>
+      val id = java.util.UUID.randomUUID.toString
 
-//  Source(1 to 10)
-//    .throttle(
-//      elements = 100,
-//      per = 1 second,
-//      maximumBurst = 100,
-//      mode = ThrottleMode.shaping
-//    )
-//    .map { _ =>
-//      val id = java.util.UUID.randomUUID.toString
-//      system.actorOf(WindTurbineSimulator.props(id, "ws://echo.websocket.org"), id)
-//    }
-//    .runWith(Sink.ignore)
+      val supervisor = BackoffSupervisor.props(
+        Backoff.onFailure(
+          WindTurbineSimulator.props(id, "ws://echo.websocket.org"),
+          childName = id,
+          minBackoff = 1 second,
+          maxBackoff = 30 seconds,
+          randomFactor = 0.2
+        ))
+
+      system.actorOf(supervisor, name = s"$id-backoff-supervisor")
+    }
+    .runWith(Sink.ignore)
 }
